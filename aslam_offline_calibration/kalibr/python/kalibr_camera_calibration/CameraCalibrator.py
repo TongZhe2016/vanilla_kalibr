@@ -43,6 +43,7 @@ class CameraGeometry(object):
         self.dv = cameraModel.designVariable(self.geometry)
         self.setDvActiveStatus(True, True, False)
         self.isGeometryInitialized = False
+        self.initPiciExports = list()
 
         #create target detector
         self.ctarget = TargetDetector(targetConfig, self.geometry, showCorners=verbose)
@@ -52,7 +53,9 @@ class CameraGeometry(object):
         self.dv.distortionDesignVariable().setActive(distortionActive)
         self.dv.shutterDesignVariable().setActive(shutterActice)
 
-    def initGeometryFromObservations(self, observations):
+    def initGeometryFromObservations(self, observations, initPiciCollector=None):
+        stage_exports = list() if initPiciCollector is not None else None
+
         #obtain focal length guess
         success = self.geometry.initializeIntrinsics(observations)
         if not success:
@@ -61,16 +64,31 @@ class CameraGeometry(object):
         #in case of an omni model, first optimize over intrinsics only
         #(--> catch most of the distortion with the projection model)
         if self.model == acvb.DistortedOmni:
-            success = kcc.calibrateIntrinsics(self, observations, distortionActive=False)
+            success = kcc.calibrateIntrinsics(
+                self,
+                observations,
+                distortionActive=False,
+                initPiciCollector=stage_exports,
+                initPiciStage="projection_only",
+            )
             if not success:
                 sm.logError("initialization of intrinsics for cam with topic {0} failed  ".format(self.dataset.topic))
         
         #optimize for intrinsics & distortion    
-        success = kcc.calibrateIntrinsics(self, observations)
+        success = kcc.calibrateIntrinsics(
+            self,
+            observations,
+            initPiciCollector=stage_exports,
+            initPiciStage="projection_plus_distortion",
+        )
         if not success:
             sm.logError("initialization of intrinsics for cam with topic {0} failed  ".format(self.dataset.topic))
         
-        self.isGeometryInitialized = success        
+        self.initPiciExports = stage_exports if stage_exports is not None else list()
+        if initPiciCollector is not None:
+            initPiciCollector.extend(stage_exports)
+
+        self.isGeometryInitialized = success
         return success
 
 class TargetDetector(object):
@@ -285,4 +303,3 @@ class CameraCalibration(object):
         else:
             sm.logDebug("The estimator did not accept this batch")
         return success
-

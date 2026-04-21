@@ -17,6 +17,8 @@ import numpy as np
 import multiprocessing
 import pylab as pl
 import argparse
+import csv
+import json
 import sys
 import random
 import signal
@@ -113,6 +115,8 @@ def parseArgs():
     outputSettings.add_argument('--plot', action='store_true', dest='plot', help='Plot during calibration (this could be slow).')
     outputSettings.add_argument('--dont-show-report', action='store_true', dest='dontShowReport', help='Do not show the report on screen after calibration.')
     outputSettings.add_argument('--export-poses', action='store_true', dest='exportPoses', help='Export the optimized poses into CSV files (one per camera, time_ns, position, quaternion)')
+    outputSettings.add_argument('--export-init-pici', action='store_true', dest='exportInitPici', help='Export per-frame pose-intrinsic coupling diagnostics for the single-camera initialization stage.')
+    outputSettings.add_argument('--init-only', action='store_true', dest='initOnly', help='Stop after per-camera intrinsic initialization (and optional PICI export).')
 
     #print help if no argument is specified
     if len(sys.argv)==1:
@@ -163,6 +167,109 @@ def output_prefix(parsed):
     return os.path.join(parsed.saveDir, stem)
 
 
+def bag_context(parsed):
+    bag_path = os.path.abspath(os.path.expanduser(parsed.bagfile))
+    seq_dir = os.path.dirname(bag_path)
+    return {
+        "bag_path": bag_path,
+        "bag_stem": os.path.splitext(os.path.basename(bag_path))[0],
+        "seq": os.path.basename(seq_dir),
+        "scenario": os.path.basename(os.path.dirname(seq_dir)),
+    }
+
+
+def write_init_pici_artifacts(parsed, cameraList, cameraInitResults):
+    bag_info = bag_context(parsed)
+    if parsed.saveDir is None:
+        out_prefix = os.path.splitext(os.path.abspath(os.path.expanduser(parsed.bagfile)))[0]
+    else:
+        out_prefix = os.path.join(parsed.saveDir, bag_info["bag_stem"])
+    framesFile = out_prefix + "-init-pici-frames.csv"
+    metaFile = out_prefix + "-init-pici-meta.json"
+    out_dir = os.path.dirname(framesFile)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+
+    fieldnames = [
+        "camera_id",
+        "init_stage",
+        "frame_index",
+        "num_corners",
+        "valid_pici",
+        "pici",
+        "fro_h_pp",
+        "fro_h_kk",
+        "fro_h_pk",
+    ]
+    rows = []
+    cameraStageStatus = []
+
+    for cam_id, cam in enumerate(cameraList):
+        stage_exports = getattr(cam, "initPiciExports", list())
+        for stage_export in stage_exports:
+            cameraStageStatus.append(
+                {
+                    "camera_id": cam_id,
+                    "topic": parsed.topics[cam_id],
+                    "model": parsed.models[cam_id],
+                    "init_stage": stage_export.get("init_stage"),
+                    "export_completed": True,
+                    "num_frames": int(stage_export.get("num_frames", 0)),
+                    "num_valid_frames": int(stage_export.get("num_valid_frames", 0)),
+                    "optimization_success": bool(stage_export.get("optimization_success", False)),
+                }
+            )
+
+            for row in stage_export.get("rows", list()):
+                rows.append(
+                    {
+                        "camera_id": cam_id,
+                        "init_stage": stage_export.get("init_stage"),
+                        "frame_index": int(row.get("frame_index", 0)),
+                        "num_corners": int(row.get("num_corners", 0)),
+                        "valid_pici": "true" if row.get("valid_pici", False) else "false",
+                        "pici": row.get("pici"),
+                        "fro_h_pp": row.get("fro_h_pp"),
+                        "fro_h_kk": row.get("fro_h_kk"),
+                        "fro_h_pk": row.get("fro_h_pk"),
+                    }
+                )
+
+    rows.sort(key=lambda row: (row["camera_id"], row["init_stage"], row["frame_index"]))
+
+    with open(framesFile, "w") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    meta = bag_info
+    meta.update(
+        {
+            "topics": list(parsed.topics),
+            "models": list(parsed.models),
+            "export_init_pici": bool(parsed.exportInitPici),
+            "init_only": bool(parsed.initOnly),
+            "camera_init_results": [
+                {
+                    "camera_id": cam_id,
+                    "topic": parsed.topics[cam_id],
+                    "model": parsed.models[cam_id],
+                    "init_success": bool(cameraInitResults[cam_id]),
+                }
+                for cam_id in range(0, len(cameraInitResults))
+            ],
+            "camera_stage_status": cameraStageStatus,
+        }
+    )
+    with open(metaFile, "w") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+
+    print("Init-stage PICI artifacts written to:")
+    print("  Frames: {0}".format(framesFile))
+    print("  Meta:   {0}".format(metaFile))
+
+
 def main():
     parsed = parseArgs()
     
@@ -179,6 +286,8 @@ def main():
 
     #create camera objects, initialize the intrinsics and extract targets
     cameraList = list()
+    cameraInitResults = list()
+    cameraInitFailures = list()
     numCams = len(parsed.topics)
 
     obsdb = kcc.ObservationDatabase(parsed.max_delta_approxsync)
@@ -196,6 +305,7 @@ def main():
             #create camera
             cameraModel = cameraModels[modelName]
             cam = kcc.CameraGeometry(cameraModel, targetConfig, dataset, verbose=(parsed.verbose or parsed.showextraction))
+            cam.modelName = modelName
                 
             #extract the targets
             multithreading = not (parsed.verbose or parsed.showextraction)
@@ -208,8 +318,16 @@ def main():
                 obsdb.addObservation(cam_id, obs)
 
             #initialize the intrinsics
-            if not cam.initGeometryFromObservations(observations):
-                raise RuntimeError("Could not initialize the intrinsics for camera with topic: {0}. Try to use --verbose and check whether the calibration target extraction is successful.".format(topic))
+            init_success = cam.initGeometryFromObservations(
+                observations,
+                initPiciCollector=list() if parsed.exportInitPici else None,
+            )
+            cameraInitResults.append(bool(init_success))
+            if not init_success:
+                cameraInitFailures.append(
+                    "Could not initialize the intrinsics for camera with topic: {0}. "
+                    "Try to use --verbose and check whether the calibration target extraction is successful.".format(topic)
+                )
             
             print("\tProjection initialized to: %s" % cam.geometry.projection().getParameters().flatten())
             print("\tDistortion initialized to: %s" % cam.geometry.projection().distortion().getParameters().flatten())
@@ -217,6 +335,20 @@ def main():
             cameraList.append(cam)
         else:
             raise RuntimeError( "Unknown camera model: {0}. Try {1}.".format(modelName, list(cameraModels.keys())) )
+
+    if parsed.exportInitPici:
+        write_init_pici_artifacts(parsed, cameraList, cameraInitResults)
+
+    if parsed.initOnly:
+        print("")
+        print("Initialization-only mode complete.")
+        if cameraInitFailures:
+            sm.logWarn("Single-camera initialization failed for {0} camera(s). See existing calibration outputs for success/failure labels.".format(len(cameraInitFailures)))
+        print("Skipping baseline initialization and full batch calibration.")
+        return
+
+    if cameraInitFailures:
+        raise RuntimeError(cameraInitFailures[0])
 
     if parsed.verbose:
         obsdb.printTable()

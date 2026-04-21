@@ -12,6 +12,103 @@ def addPoseDesignVariable(problem, T0=sm.Transformation()):
     problem.addDesignVariable(t_Dv)
     return aopt.TransformationBasicDv( q_Dv.toExpression(), t_Dv.toExpression() )
 
+
+def _get_active_pose_dvs(target_pose_dv):
+    return [
+        dv for dv in target_pose_dv.toExpression().getDesignVariables()
+        if dv is not None and dv.isActive() and dv.minimalDimensions() > 0
+    ]
+
+
+def _get_active_intrinsic_dvs(cam_geometry):
+    dvs = [
+        cam_geometry.dv.projectionDesignVariable(),
+        cam_geometry.dv.distortionDesignVariable(),
+        cam_geometry.dv.shutterDesignVariable(),
+    ]
+    return [
+        dv for dv in dvs
+        if dv is not None and dv.isActive() and dv.minimalDimensions() > 0
+    ]
+
+
+def _jacobian_or_zeros(jacobians, dv):
+    cols = dv.minimalDimensions()
+    if cols <= 0:
+        return np.zeros((jacobians.rows(), 0))
+    try:
+        J = jacobians.Jacobian(dv)
+    except Exception:
+        return np.zeros((jacobians.rows(), cols))
+    return np.array(J, dtype=float, copy=True)
+
+
+def _stack_jacobians(jacobians, dvs):
+    if not dvs:
+        return np.zeros((jacobians.rows(), 0))
+    return np.hstack([_jacobian_or_zeros(jacobians, dv) for dv in dvs])
+
+
+def _compute_frame_local_hessian(frame_errors, pose_dvs, intrinsic_dvs):
+    pose_dim = sum(dv.minimalDimensions() for dv in pose_dvs)
+    intrinsic_dim = sum(dv.minimalDimensions() for dv in intrinsic_dvs)
+
+    H_pp = np.zeros((pose_dim, pose_dim), dtype=float)
+    H_KK = np.zeros((intrinsic_dim, intrinsic_dim), dtype=float)
+    H_pK = np.zeros((pose_dim, intrinsic_dim), dtype=float)
+
+    for rerr in frame_errors:
+        jacobians = aopt.JacobianContainer(rerr.dimension())
+        rerr.evaluateJacobians(jacobians)
+        W = np.array(rerr.invR(), dtype=float, copy=True)
+        J_p = _stack_jacobians(jacobians, pose_dvs)
+        J_K = _stack_jacobians(jacobians, intrinsic_dvs)
+
+        H_pp += J_p.T.dot(W).dot(J_p)
+        H_KK += J_K.T.dot(W).dot(J_K)
+        H_pK += J_p.T.dot(W).dot(J_K)
+
+    fro_h_pp = float(np.linalg.norm(H_pp, ord='fro'))
+    fro_h_kk = float(np.linalg.norm(H_KK, ord='fro'))
+    fro_h_pk = float(np.linalg.norm(H_pK, ord='fro'))
+    denom = np.sqrt(fro_h_pp * fro_h_kk)
+    valid_pici = np.isfinite(denom) and denom > 0.0 and np.isfinite(fro_h_pk)
+    pici = float(fro_h_pk / denom) if valid_pici else float('nan')
+
+    return {
+        "num_corners": int(len(frame_errors)),
+        "valid_pici": bool(valid_pici),
+        "pici": pici,
+        "fro_h_pp": fro_h_pp,
+        "fro_h_kk": fro_h_kk,
+        "fro_h_pk": fro_h_pk,
+    }
+
+
+def _build_init_pici_stage(cam_geometry, target_pose_dvs, frame_reprojection_errors, init_pici_stage):
+    intrinsic_dvs = _get_active_intrinsic_dvs(cam_geometry)
+    rows = []
+    num_valid_frames = 0
+
+    for frame_index, target_pose_dv in enumerate(target_pose_dvs):
+        frame_errors = frame_reprojection_errors[frame_index]
+        row = _compute_frame_local_hessian(
+            frame_errors,
+            _get_active_pose_dvs(target_pose_dv),
+            intrinsic_dvs,
+        )
+        row["frame_index"] = int(frame_index)
+        rows.append(row)
+        if row["valid_pici"]:
+            num_valid_frames += 1
+
+    return {
+        "init_stage": init_pici_stage,
+        "rows": rows,
+        "num_frames": int(len(rows)),
+        "num_valid_frames": int(num_valid_frames),
+    }
+
 def stereoCalibrate(camL_geometry, camH_geometry, obslist, distortionActive=False, baseline=None):
     #####################################################
     ## find initial guess as median of  all pnp solutions
@@ -185,7 +282,7 @@ def stereoCalibrate(camL_geometry, camH_geometry, obslist, distortionActive=Fals
         return success, baseline_HL
 
 
-def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsicsActive=True):
+def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsicsActive=True, initPiciCollector=None, initPiciStage=None):
     #verbose output
     if sm.getLoggingLevel()==sm.LoggingLevel.Debug:
         d = cam_geometry.geometry.projection().distortion().getParameters().flatten()
@@ -213,13 +310,15 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
     target = cam_geometry.ctarget.detector.target()
     
     #target pose dv for all target views (=T_camL_w)
-    reprojectionErrors = [];    
+    reprojectionErrors = [];
+    frame_reprojection_errors = []
     sm.logDebug("calibrateIntrinsics: adding camera error terms for {0} calibration targets".format(len(obslist)))
     target_pose_dvs=list()
     for obs in obslist: 
         success, T_t_c = cam_geometry.geometry.estimateTransformation(obs)
         target_pose_dv = addPoseDesignVariable(problem, T_t_c)
         target_pose_dvs.append(target_pose_dv)
+        frame_errors = []
         
         T_cam_w = target_pose_dv.toExpression().inverse()
     
@@ -231,6 +330,8 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
                 rerr = cam_geometry.model.reprojectionError(y, invR, T_cam_w * p_target, cam_geometry.dv)
                 problem.addErrorTerm(rerr)
                 reprojectionErrors.append(rerr)
+                frame_errors.append(rerr)
+        frame_reprojection_errors.append(frame_errors)
                                                     
     sm.logDebug("calibrateIntrinsics: added {0} camera error terms".format(len(reprojectionErrors)))
     
@@ -248,6 +349,19 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
     optimizer = aopt.Optimizer2(options)
     optimizer.setProblem(problem)
 
+    init_pici_export = None
+    if initPiciCollector is not None:
+        optimizer.initialize()
+        stage_name = initPiciStage
+        if stage_name is None:
+            stage_name = "projection_plus_distortion" if distortionActive else "projection_only"
+        init_pici_export = _build_init_pici_stage(
+            cam_geometry,
+            target_pose_dvs,
+            frame_reprojection_errors,
+            stage_name,
+        )
+
     #verbose output
     if sm.getLoggingLevel()==sm.LoggingLevel.Debug:
         sm.logDebug("Before optimization:")
@@ -264,6 +378,10 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
     except:
         sm.logError("calibrateIntrinsics: Optimization failed!")
         success = False
+
+    if init_pici_export is not None:
+        init_pici_export["optimization_success"] = bool(success)
+        initPiciCollector.append(init_pici_export)
     
     #verbose output
     if sm.getLoggingLevel()==sm.LoggingLevel.Debug:
@@ -381,4 +499,3 @@ def solveFullBatch(cameras, baseline_guesses, graph):
         baselines.append( sm.Transformation(baseline_dv.T()) )
     
     return success, baselines
-
